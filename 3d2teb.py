@@ -124,7 +124,7 @@ class PCData(Dataset):
     def __init__(self, pts, lbls, augment=False):
         pts = pts - pts.mean(axis=1, keepdims=True)
         s = np.max(np.linalg.norm(pts, axis=2), axis=1, keepdims=True)
-        pts = pts / np.maximum(s, 1e-8)
+        pts = pts / np.maximum(s[:, :, None], 1e-8)
         self.pts = torch.tensor(pts, dtype=torch.float32)
         self.lbls = torch.tensor(lbls, dtype=torch.long)
         self.augment = augment
