@@ -137,7 +137,7 @@ class PCData(Dataset):
         if self.augment:
             theta = torch.rand(1).item() * 2 * np.pi
             c, s = np.cos(theta), np.sin(theta)
-            rot = torch.tensor([[c, -s, 0.], [s, c, 0.], [0., 0., 1.]])
+            rot = torch.tensor([[c, -s, 0.], [s, c, 0.], [0., 0., 1.]], dtype=torch.float32)
             p = p @ rot.T + torch.randn_like(p) * 0.01
         return p, self.lbls[i]
 
