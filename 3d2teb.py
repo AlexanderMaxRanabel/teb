@@ -10,8 +10,7 @@ import glob
 import time
 
 # ==========================================
-# TEB on ModelNet10 — 3D Point Cloud Classification
-# Source: Princeton 3DShapeNets (original dataset, .off files)
+# TEB on ModelNet10 v2 — anti-overfit
 # ==========================================
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -23,9 +22,7 @@ EXTRACT_DIR = "ModelNet10"
 CACHE = "modelnet10_cache.npz"
 NUM_POINTS = 1024
 
-# ==========================================
-# Parse OFF file -> sample points from vertices
-# ==========================================
+
 def parse_off(path, num_points):
     with open(path, 'r') as f:
         first = f.readline().strip()
@@ -50,9 +47,6 @@ def parse_off(path, num_points):
     return verts[idx]
 
 
-# ==========================================
-# Build cache (once) from Princeton zip
-# ==========================================
 if not os.path.exists(CACHE):
     if not os.path.exists(EXTRACT_DIR):
         if not os.path.exists(ZIP_PATH):
@@ -77,8 +71,7 @@ if not os.path.exists(CACHE):
             folder = os.path.join(EXTRACT_DIR, cls, split)
             if not os.path.isdir(folder):
                 continue
-            offs = glob.glob(os.path.join(folder, '*.off'))
-            for off in offs:
+            for off in glob.glob(os.path.join(folder, '*.off')):
                 try:
                     pts_list.append(parse_off(off, NUM_POINTS))
                     lbl_list.append(ci)
@@ -104,22 +97,23 @@ print(f"Shape: {train_pts.shape}")
 print("-" * 50)
 
 # ==========================================
-# Hyperparameters
+# Hyperparameters (v2)
 # ==========================================
 BATCH_SIZE = 32
-EPOCHS = 80
-DIM = 128
-NUM_LAYERS = 3
+EPOCHS = 150
+DIM = 64                    # was 128
+NUM_LAYERS = 2              # was 3
 TEB_STEPS = 3
 K_NEIGHBORS = 16
 SIGMA = 1.0
-ALPHA = 1.5
+ALPHA = 1.0                 # was 1.5 — ablate extrapolation
 LR = 1e-3
+WEIGHT_DECAY = 1e-3         # was 1e-4
+DROPOUT = 0.3               # new
+PATIENCE = 25               # early stopping
 NUM_CLASSES = len(set(train_lbls.tolist()))
 
-# ==========================================
-# Dataset
-# ==========================================
+
 class PCData(Dataset):
     def __init__(self, pts, lbls, augment=False):
         pts = pts - pts.mean(axis=1, keepdims=True)
@@ -147,11 +141,9 @@ test_ds  = PCData(test_pts,  test_lbls,  augment=False)
 train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,  num_workers=2, drop_last=True)
 test_loader  = DataLoader(test_ds,  batch_size=BATCH_SIZE, shuffle=False, num_workers=2)
 
-# ==========================================
-# TEB Layer (point cloud version)
-# ==========================================
+
 class SparseIterativeEmergenceLayer(nn.Module):
-    def __init__(self, dim, steps=3, k=16, sigma=1.0, alpha=1.5):
+    def __init__(self, dim, steps=3, k=16, sigma=1.0, alpha=1.0, dropout=0.3):
         super().__init__()
         self.steps = steps
         self.k = k
@@ -160,6 +152,7 @@ class SparseIterativeEmergenceLayer(nn.Module):
         self.gate_proj = nn.Linear(dim * 2, dim)
         self.update_proj = nn.Linear(dim, dim)
         self.ln = nn.LayerNorm(dim)
+        self.drop = nn.Dropout(dropout)
 
     def forward(self, x):
         B, N, D = x.shape
@@ -206,22 +199,26 @@ class SparseIterativeEmergenceLayer(nn.Module):
             update = self.update_proj(update)
             gate = torch.sigmoid(self.gate_proj(torch.cat([x, update], dim=-1)))
             x = self.ln(x + gate * update)
+            x = self.drop(x)
 
         return x
 
 
 class TEBPointCloud(nn.Module):
-    def __init__(self, num_classes, dim=128, num_layers=3,
-                 steps=3, k=16, sigma=1.0, alpha=1.5):
+    def __init__(self, num_classes, dim=64, num_layers=2,
+                 steps=3, k=16, sigma=1.0, alpha=1.0, dropout=0.3):
         super().__init__()
         self.input_proj = nn.Linear(3, dim)
         self.layers = nn.ModuleList([
-            SparseIterativeEmergenceLayer(dim, steps=steps, k=k, sigma=sigma, alpha=alpha)
+            SparseIterativeEmergenceLayer(dim, steps=steps, k=k, sigma=sigma,
+                                          alpha=alpha, dropout=dropout)
             for _ in range(num_layers)
         ])
         self.head = nn.Sequential(
+            nn.Dropout(dropout),
             nn.Linear(dim * 2, dim),
             nn.GELU(),
+            nn.Dropout(dropout),
             nn.Linear(dim, num_classes),
         )
 
@@ -234,9 +231,6 @@ class TEBPointCloud(nn.Module):
         return self.head(torch.cat([h_max, h_mean], dim=-1))
 
 
-# ==========================================
-# Training helpers
-# ==========================================
 def train_epoch(model, loader, opt, crit):
     model.train()
     tl, c, t = 0., 0, 0
@@ -269,57 +263,73 @@ def evaluate(model, loader, crit):
 
 
 # ==========================================
-# Train TEB
+# Train TEB v2
 # ==========================================
 model = TEBPointCloud(
     num_classes=NUM_CLASSES, dim=DIM, num_layers=NUM_LAYERS,
-    steps=TEB_STEPS, k=K_NEIGHBORS, sigma=SIGMA, alpha=ALPHA
+    steps=TEB_STEPS, k=K_NEIGHBORS, sigma=SIGMA, alpha=ALPHA, dropout=DROPOUT
 ).to(device)
 
-print(f"TEB params: {sum(p.numel() for p in model.parameters()):,}")
+print(f"TEB v2 params: {sum(p.numel() for p in model.parameters()):,}")
 
-opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
+opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
 sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=EPOCHS)
 crit = nn.CrossEntropyLoss(label_smoothing=0.1)
 
-print("\nTraining TEB on ModelNet10...")
+print("\nTraining TEB v2 on ModelNet10...")
 best = 0.0
+best_epoch = 0
 start = time.time()
 
 for epoch in range(EPOCHS):
     tr_loss, tr_acc = train_epoch(model, train_loader, opt, crit)
     te_loss, te_acc = evaluate(model, test_loader, crit)
     sched.step()
-    best = max(best, te_acc)
+
+    if te_acc > best:
+        best = te_acc
+        best_epoch = epoch
+        torch.save(model.state_dict(), "best_teb_v2.pt")
+
     if epoch % 5 == 0 or epoch == EPOCHS - 1:
         print(f"Epoch {epoch:3d} | Train {tr_loss:.3f}/{tr_acc:.3f} | "
-              f"Test {te_loss:.3f}/{te_acc:.3f} | {time.time()-start:.1f}s")
+              f"Test {te_loss:.3f}/{te_acc:.3f} | "
+              f"Best {best:.3f}@{best_epoch} | {time.time()-start:.1f}s")
 
-print(f"\nBest TEB test accuracy: {best:.4f}")
+    if epoch - best_epoch >= PATIENCE:
+        print(f"\nEarly stop at epoch {epoch} (no improvement for {PATIENCE} epochs).")
+        break
+
+print(f"\nBest TEB v2 test accuracy: {best:.4f} (epoch {best_epoch})")
 
 
 # ==========================================
 # PointNet baseline
 # ==========================================
 class PointNetBaseline(nn.Module):
-    def __init__(self, num_classes, dim=128):
+    def __init__(self, num_classes, dim=64, dropout=0.3):
         super().__init__()
         self.mlp = nn.Sequential(
             nn.Linear(3, 64), nn.ReLU(),
             nn.Linear(64, dim), nn.ReLU(),
             nn.Linear(dim, dim),
         )
-        self.head = nn.Sequential(nn.Linear(dim, dim), nn.ReLU(), nn.Linear(dim, num_classes))
+        self.head = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Linear(dim, dim), nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim, num_classes),
+        )
 
     def forward(self, x):
         h = self.mlp(x).max(dim=1).values
         return self.head(h)
 
 
-pn = PointNetBaseline(NUM_CLASSES, DIM).to(device)
+pn = PointNetBaseline(NUM_CLASSES, DIM, DROPOUT).to(device)
 print(f"\nPointNet params: {sum(p.numel() for p in pn.parameters()):,}")
 
-pn_opt = torch.optim.AdamW(pn.parameters(), lr=LR, weight_decay=1e-4)
+pn_opt = torch.optim.AdamW(pn.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
 pn_sched = torch.optim.lr_scheduler.CosineAnnealingLR(pn_opt, T_max=EPOCHS)
 
 print("\nTraining PointNet baseline...")
@@ -330,7 +340,8 @@ for epoch in range(EPOCHS):
     pn_sched.step()
     best_pn = max(best_pn, te_acc)
     if epoch % 10 == 0 or epoch == EPOCHS - 1:
-        print(f"Epoch {epoch:3d} | Train {tr_loss:.3f}/{tr_acc:.3f} | Test {te_loss:.3f}/{te_acc:.3f}")
+        print(f"Epoch {epoch:3d} | Train {tr_loss:.3f}/{tr_acc:.3f} | "
+              f"Test {te_loss:.3f}/{te_acc:.3f}")
 
 print(f"\nBest PointNet test accuracy: {best_pn:.4f}")
-print(f"Best TEB test accuracy:      {best:.4f}")
+print(f"Best TEB v2 test accuracy:   {best:.4f}")
