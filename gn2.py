@@ -1,34 +1,5 @@
 """
-gn2.py  --  Geometric Neurons v2
-
-What changed vs gn.py (GN v1 got best val 2.439, worse than TEB's 2.32):
-
- 1. RELATIVE-POSITION DISTANCE BIAS (the main change).
-    In v1 the kNN geometry lived purely in embedding space, so a token's nearest
-    neighbours were probably other tokens with the same / similar CHARACTER, not the
-    tokens next to it. v2 adds a learnable per-GN penalty on sequence distance:
-        dist_total(i,j) = dist_content(i,j) + softplus(beta_g) * (2*D / pos_ref) * (i - j)
-    beta is initialised log-spaced across the GNs (e.g. 0.05 ... 1.0), so GNs START in
-    different range regimes (very local ... fairly global) and can still learn their own.
-    beta=1 means "pos_ref tokens back costs as much as a typical full content distance".
-    Pass --no_pos_bias to switch it off (this is then v1 geometry).
-
- 2. DIAGNOSTICS THAT MEAN SOMETHING (the v1 cosine "GN-sim" did not, because each GN
-    writes through its own random output basis). Printed at init and at the end:
-      * per GN: % of neighbours that are the SAME character, mean look-back distance,
-        % of neighbours within 4 tokens
-      * per layer: mean Jaccard overlap of the neighbour SETS between GNs
-        (basis-free: 1.0 = GNs find identical neighbourhoods, ~0 = different)
-      * per GN ablation: val-loss increase when that GN's output is zeroed
-        (the real test of "is this neuron doing something / are they different")
-
- 3. TRAINING: warmup + cosine LR decay (v1 was constant LR and still improving),
-    fixed validation batches (smoother, comparable curve), seed flag, best checkpoint
-    saved to gn2_best.pt, no weight decay on beta.
-
-Reproduce roughly the v1 setup:   python gn2.py --mode full --no_pos_bias --sched const
-Main v2 run:                      python -u gn2.py --mode full 2>&1 | tee gn2_run.log
-Check everything is wired:        python gn2.py --selftest
+gn2.py  --  Geometric Neurons v2 (Updated)
 """
 import argparse
 import math
@@ -39,27 +10,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
 def inv_softplus(y):
     return math.log(math.expm1(y))
 
-
-# --------------------------------------------------------------------------- #
-#  TEB core with optional learnable relative-position distance bias
-# --------------------------------------------------------------------------- #
 class TEBCore(nn.Module):
-    """
-    x: [B, N, D] -> [B, N, D]   (see gn.py for the derivation of the M-matrix trick)
-
-    sigma / radius are relative to sqrt(D) because the GN input space is LayerNorm'd
-    (typical squared distance between two points ~ 2*D).
-    """
-
     def __init__(self, dim, k=8, sigma_rel=1.0, steps=2, radius_rel=0.0, pos_beta=None, pos_ref=16.0):
         super().__init__()
         self.dim, self.k, self.steps = dim, k, steps
         self.sigma = sigma_rel * math.sqrt(dim)
-        self.radius = radius_rel * math.sqrt(dim)  # 0 = off
+        self.radius = radius_rel * math.sqrt(dim)
         self.pos_ref = float(pos_ref)
         if pos_beta is None:
             self.beta_raw = None
@@ -70,7 +29,6 @@ class TEBCore(nn.Module):
         self.gate = nn.Linear(dim, dim)
         self.norm = nn.LayerNorm(dim)
         nn.init.constant_(self.gate.bias, -1.0)
-        # diagnostics: when record=True the neighbour indices of the FIRST step are kept
         self.record = False
         self._rec = None
 
@@ -81,12 +39,11 @@ class TEBCore(nn.Module):
         B, N, D = x.shape
         k = min(self.k, N)
 
-        # ---- causal squared distances (+ relative-position penalty) ---------- #
         sq = (x * x).sum(-1)
         dist = (sq.unsqueeze(2) + sq.unsqueeze(1) - 2 * x @ x.transpose(1, 2)).clamp_min(0)
         if self.beta_raw is not None:
             ar = torch.arange(N, device=x.device)
-            rel = (ar[:, None] - ar[None, :]).clamp_min(0).to(x.dtype)       # i - j for j <= i
+            rel = (ar[:, None] - ar[None, :]).clamp_min(0).to(x.dtype)
             dist = dist + F.softplus(self.beta_raw) * (2.0 * D / self.pos_ref) * rel
         future = torch.ones(N, N, dtype=torch.bool, device=x.device).triu(1)
         blocked = future
@@ -94,8 +51,7 @@ class TEBCore(nn.Module):
             blocked = blocked | (dist > self.radius ** 2)
         dist = dist.masked_fill(blocked, float("inf"))
 
-        # ---- kNN ----------------------------------------------------------- #
-        vals, idx = torch.topk(dist, k, dim=-1, largest=False)               # [B,N,k]
+        vals, idx = torch.topk(dist, k, dim=-1, largest=False)
         valid = torch.isfinite(vals)
         validf = valid.float()
         if self.record and self._rec is None:
@@ -105,7 +61,6 @@ class TEBCore(nn.Module):
         A = torch.zeros(B, N, N, device=x.device, dtype=x.dtype).scatter(2, idx, validf)
         Wd = torch.zeros(B, N, N, device=x.device, dtype=x.dtype).scatter(2, idx, w)
 
-        # ---- intersections ------------------------------------------------- #
         A_j = torch.gather(A, 1, idx.reshape(B, N * k, 1).expand(-1, -1, N)).view(B, N, k, N)
         size = torch.einsum("bnam,bnm->bna", A_j, A) * validf
         den = torch.einsum("bnam,bnm->bna", A_j, Wd)
@@ -121,7 +76,6 @@ class TEBCore(nn.Module):
             x = self.one_step(x)
         return x
 
-
 class GeometricNeuron(nn.Module):
     def __init__(self, dim, gn_dim, k, sigma_rel, steps, radius_rel, pos_beta, pos_ref):
         super().__init__()
@@ -132,23 +86,17 @@ class GeometricNeuron(nn.Module):
     def forward(self, x):
         return self.out_proj(self.teb(self.in_proj(x)))
 
-
 def _per_gn(value, num_gn):
-    """scalar -> repeated; list of any length -> cycled across GNs ([8,16] x4 -> 8,16,8,16)."""
     if isinstance(value, (list, tuple)):
         return [value[i % len(value)] for i in range(num_gn)]
     return [value] * num_gn
-
 
 def default_betas(num_gn, lo=0.05, hi=1.0):
     if num_gn == 1:
         return [0.2]
     return [lo * (hi / lo) ** (g / (num_gn - 1)) for g in range(num_gn)]
 
-
 class GNLayer(nn.Module):
-    """G geometric neurons in parallel -> concat -> project -> residual."""
-
     def __init__(self, dim, num_gn=4, gn_dim=None, k=8, sigma_rel=1.0, steps=2, radius_rel=0.0,
                  pos_beta="auto", pos_ref=16.0):
         super().__init__()
@@ -162,7 +110,7 @@ class GNLayer(nn.Module):
             for i in range(num_gn)
         ])
         self.merge = nn.Linear(dim * num_gn, dim)
-        self.ablate = None  # index of a GN whose output is zeroed (for ablation studies)
+        self.ablate = None
 
     def forward(self, x):
         h = self.norm_in(x)
@@ -170,7 +118,6 @@ class GNLayer(nn.Module):
         if self.ablate is not None:
             outs[self.ablate] = torch.zeros_like(outs[self.ablate])
         return x + self.merge(torch.cat(outs, dim=-1))
-
 
 class GNLM(nn.Module):
     def __init__(self, vocab, dim, seq_len, depth=2, num_gn=4, gn_dim=None, k=8, sigma_rel=1.0,
@@ -204,13 +151,8 @@ class GNLM(nn.Module):
             idx = torch.cat([idx, torch.multinomial(probs, 1)], dim=1)
         return idx
 
-
-# --------------------------------------------------------------------------- #
-#  Diagnostics
-# --------------------------------------------------------------------------- #
 @torch.no_grad()
 def diagnose(model, ids, title=""):
-    """Neighbour statistics per GN + neighbour-set Jaccard between GNs in each layer."""
     was_training = model.training
     model.eval()
     gns = [(li, gi, gn) for li, l in enumerate(model.layers) for gi, gn in enumerate(l.gns)]
@@ -225,11 +167,11 @@ def diagnose(model, ids, title=""):
     eye = torch.eye(N, device=dev).unsqueeze(0)
     adj = {}
     print(f"\n=== neighbour diagnostics {title} ===")
-    print("layer GN |   k  beta |  same-char%  mean-lookback  within-4%")
+    print("Lyr GN |   k  beta | same-char%  lookback  within-4%")
     for li, gi, gn in gns:
         idx, valid = gn.teb._rec
-        offset = pos.view(1, N, 1) - idx                           # how far back each neighbour is
-        keep = valid & (offset > 0)                                # drop self
+        offset = pos.view(1, N, 1) - idx
+        keep = valid & (offset > 0)
         nb_tok = torch.gather(tok_exp, 2, idx)
         same = (nb_tok == ids.unsqueeze(-1)) & keep
         n = keep.sum().clamp_min(1).float()
@@ -238,7 +180,7 @@ def diagnose(model, ids, title=""):
         near_pct = 100 * ((offset <= 4) & keep).sum().item() / n.item()
         b = gn.teb.beta()
         bs = "  off" if b is None else f"{b.item():5.2f}"
-        print(f"  {li}    {gi}  | {gn.teb.k:3d} {bs} | {same_pct:9.1f}  {mean_off:13.1f}  {near_pct:9.1f}")
+        print(f" {li}   {gi} | {gn.teb.k:3d} {bs} | {same_pct:9.1f}  {mean_off:8.1f}  {near_pct:9.1f}")
         A = torch.zeros(B, N, N, device=dev).scatter(2, idx, valid.float()) * (1 - eye)
         adj[(li, gi)] = A
     for li, layer in enumerate(model.layers):
@@ -251,48 +193,38 @@ def diagnose(model, ids, title=""):
                 union = ((Aa + Ab) > 0).float().sum().clamp_min(1)
                 js.append((inter / union).item())
         if js:
-            print(f"layer {li}: mean neighbour-set Jaccard between GNs = {sum(js)/len(js):.3f} "
-                  f"(1 = identical neighbourhoods, 0 = disjoint)")
+            print(f"layer {li}: mean Jaccard between GNs = {sum(js)/len(js):.3f}")
     for _, _, gn in gns:
         gn.teb.record, gn.teb._rec = False, None
     model.train(was_training)
     print()
 
-
 @torch.no_grad()
 def ablation(model, batches):
-    """Val-loss increase when each GN's output is zeroed. Near 0 for all = GNs not contributing."""
     was_training = model.training
     model.eval()
-
     def val_loss():
         return sum(model(x, y)[1].item() for x, y in batches) / len(batches)
-
     base = val_loss()
-    print(f"=== GN ablation (base val loss {base:.4f}; value = loss increase when that GN is zeroed) ===")
+    print(f"=== GN ablation (base val {base:.4f}; + value = loss increase) ===")
     for li, layer in enumerate(model.layers):
         row = []
         for gi in range(len(layer.gns)):
             layer.ablate = gi
             row.append(val_loss() - base)
         layer.ablate = None
-        print(f"layer {li}: " + "  ".join(f"GN{gi}:{d:+.4f}" for gi, d in enumerate(row)))
+        print(f"layer {li}: " + " ".join(f"GN{gi}:{d:+.4f}" for gi, d in enumerate(row)))
     model.train(was_training)
     print()
 
-
-# --------------------------------------------------------------------------- #
-#  Data / config / training
-# --------------------------------------------------------------------------- #
 PRESETS = {
     "lite": dict(data_size=180_000, seq_len=32, batch=8, steps_train=2000, dim=40, depth=1,
                  num_gn=4, gn_dim=40, k=[4, 6], sigma_rel=1.0, teb_steps=2, lr=5e-4,
                  pos_beta="auto", pos_ref=16.0, sched="cosine", seed=0),
-    "full": dict(data_size=1_115_394, seq_len=128, batch=64, steps_train=5000, dim=128, depth=2,
+    "full": dict(data_size=1_115_394, seq_len=128, batch=64, steps_train=10000, dim=128, depth=2,
                  num_gn=4, gn_dim=64, k=[8, 16], sigma_rel=1.0, teb_steps=2, lr=1e-3,
                  pos_beta="auto", pos_ref=16.0, sched="cosine", seed=0),
 }
-
 
 def load_text(path="input.txt"):
     if not os.path.exists(path):
@@ -301,18 +233,15 @@ def load_text(path="input.txt"):
         urllib.request.urlretrieve(url, path)
     return open(path, encoding="utf-8").read()
 
-
 def get_batch(data, B, N, device, gen=None):
     ix = torch.randint(len(data) - N - 1, (B,), generator=gen)
     x = torch.stack([data[i:i + N] for i in ix]).to(device)
     y = torch.stack([data[i + 1:i + N + 1] for i in ix]).to(device)
     return x, y
 
-
 def fixed_batches(data, B, N, device, n=20, seed=1234):
     g = torch.Generator().manual_seed(seed)
     return [get_batch(data, B, N, device, g) for _ in range(n)]
-
 
 @torch.no_grad()
 def evaluate(model, batches):
@@ -320,7 +249,6 @@ def evaluate(model, batches):
     loss = sum(model(x, y)[1].item() for x, y in batches) / len(batches)
     model.train()
     return loss
-
 
 def lr_at(step, total, base, sched, warmup=100):
     if step < warmup:
@@ -330,11 +258,9 @@ def lr_at(step, total, base, sched, warmup=100):
     p = (step - warmup) / max(1, total - warmup)
     return base * (0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * p)))
 
-
 def build_model(vocab, cfg):
     return GNLM(vocab, cfg["dim"], cfg["seq_len"], cfg["depth"], cfg["num_gn"], cfg["gn_dim"], cfg["k"],
                 cfg["sigma_rel"], cfg["teb_steps"], 0.0, cfg["pos_beta"], cfg["pos_ref"])
-
 
 def beta_str(model):
     out = []
@@ -342,7 +268,6 @@ def beta_str(model):
         bs = [gn.teb.beta() for gn in l.gns]
         out.append("/".join("off" if b is None else f"{b.item():.2f}" for b in bs))
     return " | ".join(out)
-
 
 def train(cfg, device):
     torch.manual_seed(cfg["seed"])
@@ -391,10 +316,6 @@ def train(cfg, device):
     print("--- sample ---")
     print("".join(itos[i] for i in model.generate(ctx)[0].tolist()))
 
-
-# --------------------------------------------------------------------------- #
-#  Self test
-# --------------------------------------------------------------------------- #
 def selftest():
     torch.manual_seed(0)
     for pb in ("auto", None):
@@ -413,22 +334,7 @@ def selftest():
         x2[:, 12:] = torch.randint(0, 50, (2, 12))
         assert torch.allclose(m(x)[0][:, :12], m(x2)[0][:, :12], atol=1e-5), f"causality leak (pos_beta={pb})"
         print(f"model OK (pos_beta={pb}): shapes, grads, causality")
-
-    m = GNLM(vocab=50, dim=32, seq_len=24, depth=2, num_gn=3, gn_dim=24, k=[4, 6, 8], pos_beta="auto")
-    x = torch.randint(0, 50, (4, 24))
-    diagnose(m, x, title="selftest")
-    ablation(m, [(x, x)])
-
-    for name, c in PRESETS.items():
-        cc = dict(c, seq_len=16)
-        mm = build_model(65, cc)
-        xx = torch.randint(0, 65, (2, 16))
-        _, ll = mm(xx, xx)
-        ll.backward()
-        assert torch.isfinite(ll), name
-        print(f"preset '{name}' OK")
     print("selftest OK")
-
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
@@ -436,7 +342,7 @@ if __name__ == "__main__":
     ap.add_argument("--num_gn", type=int)
     ap.add_argument("--gn_dim", type=int)
     ap.add_argument("--depth", type=int)
-    ap.add_argument("--k", type=int, nargs="+", help="1 value (all GNs) or a list that cycles across GNs")
+    ap.add_argument("--k", type=int, nargs="+")
     ap.add_argument("--sigma_rel", type=float, nargs="+")
     ap.add_argument("--teb_steps", type=int)
     ap.add_argument("--steps_train", type=int)
@@ -444,8 +350,8 @@ if __name__ == "__main__":
     ap.add_argument("--seed", type=int)
     ap.add_argument("--sched", choices=["cosine", "const"])
     ap.add_argument("--pos_ref", type=float)
-    ap.add_argument("--pos_beta", type=float, nargs="+", help="initial beta per GN (cycles); default log-spaced")
-    ap.add_argument("--no_pos_bias", action="store_true", help="disable the position penalty (v1 geometry)")
+    ap.add_argument("--pos_beta", type=float, nargs="+")
+    ap.add_argument("--no_pos_bias", action="store_true")
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args()
     if a.selftest:
