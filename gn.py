@@ -123,10 +123,8 @@ class GeometricNeuron(nn.Module):
 
 def _per_gn(value, num_gn, name):
     if isinstance(value, (list, tuple)):
-        if len(value) == 1:
-            return list(value) * num_gn
-        assert len(value) == num_gn, f"{name} needs 1 or {num_gn} values, got {len(value)}"
-        return list(value)
+        # a list of any length cycles across the GNs: [8, 16] with 4 GNs -> 8, 16, 8, 16
+        return [value[i % len(value)] for i in range(num_gn)]
     return [value] * num_gn
 
 
@@ -280,6 +278,16 @@ def selftest():
     a, b = m(x)[0], m(x2)[0]
     assert torch.allclose(a[:, :12], b[:, :12], atol=1e-5), "causality leak!"
     print("selftest OK  | loss", round(loss.item(), 3), "| GN similarity", m.layers[0].last_similarity)
+
+    # build every preset and run one tiny forward/backward, so config bugs show up here
+    # (shrunk batch/seq so it is fast even on CPU)
+    for name, c in PRESETS.items():
+        mm = GNLM(65, c["dim"], 16, c["depth"], c["num_gn"], c["gn_dim"], c["k"], c["sigma_rel"], c["teb_steps"])
+        xx = torch.randint(0, 65, (2, 16))
+        _, ll = mm(xx, xx)
+        ll.backward()
+        assert torch.isfinite(ll), name
+        print(f"preset '{name}' OK")
 
 
 if __name__ == "__main__":
